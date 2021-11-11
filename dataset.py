@@ -2,13 +2,14 @@ import pdb
 import json
 import torch
 import pickle
-from . import ontology
+import ontology
 from tqdm import tqdm
+from base_logger import logger
 from transformers import  AutoTokenizer
 # here, squad means squad2
 
 class Dataset(torch.utils.data.Dataset):
-    def __init__(self, data_path, type, tokenizer, debug=True):
+    def __init__(self, data_path, type, data_rate, tokenizer, debug=True):
         self.tokenizer = tokenizer
         self.encodings = []
         self.error_list = {}
@@ -17,8 +18,8 @@ class Dataset(torch.utils.data.Dataset):
             if debug:
                 0/0
             else :    
-                print("Load processed data")
-                with open(f'data/preprocessed_{type}.pickle', 'rb') as f:
+                print(f"data/preprocessed_{type}_{data_rate}.pickle")
+                with open(f'data/preprocessed_{type}_{data_rate}.pickle', 'rb') as f:
                     encodings = pickle.load(f)
                     self.encodings = encodings
         except:
@@ -33,7 +34,7 @@ class Dataset(torch.utils.data.Dataset):
             encodings = self._add_token_positions(encodings, answer)
             encodings.update({'dial_id' :dial_id, 'turn_id' : turn_id, 'schema' : schema})
 
-            with open(f'data/preprocessed_{type}.pickle', 'wb') as f:
+            with open(f'data/preprocessed_{type}_{data_rate}.pickle', 'wb') as f:
                 pickle.dump(encodings, f, pickle.HIGHEST_PROTOCOL)
 
         self.encodings = encodings

@@ -1,7 +1,8 @@
 import os
 import torch
+import datetime, time
 import argparse
-
+from base_logger import logger
 from dataset import Dataset
 from utils import compute_F1, compute_exact_match
 from torch.utils.data import DataLoader
@@ -9,26 +10,30 @@ from transformers import AdamW
 from tqdm import tqdm
 from trainer import train, valid
 from transformers import AutoModelForQuestionAnswering, AutoTokenizer, AdamW
-from torch.utils.tensorboard import SummaryWriter
 from knockknock import email_sender
 
-import datetime
-now_time = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-writer = SummaryWriter()
-parser = argparse.ArgumentParser()
 
-parser.add_argument('--patience' ,  type = int, default=3)
-parser.add_argument('--batch_size' , type = int, default=16)
+import torch.distributed as dist
+import torch.multiprocessing as mp
+from torch.nn.parallel import DistributedDataParallel as DDP
+
+parser = argparse.ArgumentParser()
+parser.add_argument('--data_rate' ,  type = int, default=0.01)
+parser.add_argument('--patience' ,  type = int, default=1)
+parser.add_argument('--batch_size' , type = int, default=4)
 parser.add_argument('--max_epoch' ,  type = int, default=1)
 parser.add_argument('--base_trained_model', type = str, default = 'bert-base-uncased', help =" pretrainned model from 🤗")
 parser.add_argument('--pretrained_model' , type = str,  help = 'pretrainned model')
 parser.add_argument('--gpu_number' , type = int,  default = 0, help = 'which GPU will you use?')
 parser.add_argument('--debugging' , type = bool,  default = False, help = "Don't save file")
-parser.add_argument('--log_file' , type = str,  default = f'logs/log_{now_time}.txt',)
-parser.add_argument('--dev_path' ,  type = str,  default = '../data/MultiWOZ_2.1/dev_data.json')
-parser.add_argument('--train_path' , type = str,  default = '../data/MultiWOZ_2.1/train_data.json')
+parser.add_argument('--dev_path' ,  type = str,  default = '../woz-data/MultiWOZ_2.1/dev_data.json')
+parser.add_argument('--train_path' , type = str,  default = '../woz-data/MultiWOZ_2.1/train_data.json')
 parser.add_argument('--do_train' , default = True, help = 'do train or not', action=argparse.BooleanOptionalAction)
-
+parser.add_argument('--num_worker',default=6, type=int,help='cpus')
+parser.add_argument('-n', '--nodes', default=1,type=int, metavar='N')
+parser.add_argument('-g', '--gpus', default=2, type=int,help='number of gpus per node')
+parser.add_argument('-nr', '--nr', default=0, type=int,help='ranking within the nodes')
+parser.add_argument('--max_length' , type = int,  default = 512, help = 'max length')
 
 args = parser.parse_args()
 
@@ -38,77 +43,95 @@ def makedirs(path):
    except OSError: 
        if not os.path.isdir(path): 
            raise
-       
 
-args = parser.parse_args()
 
-# @email_sender(recipient_emails=["jihyunlee@postech.ac.kr"], sender_email="knowing.deep.clean.water@gmail.com")
-def main():
-    makedirs("./data"); makedirs("./logs"); makedirs("./model");
+def main_worker(gpu, args):
+    logger.info(f'{gpu} works!')
+    batch_size = int(args.batch_size / args.gpus)
+    num_worker = int(args.num_worker / args.gpus)
     
+    torch.distributed.init_process_group(
+        backend='nccl',
+        init_method='tcp://127.0.0.1:3456',
+        world_size=args.gpus,
+        rank=gpu)
+      
+    torch.cuda.set_device(gpu)
     
-    # import pdb; pdb.set_trace()
-    tokenizer = AutoTokenizer.from_pretrained(args.base_trained_model, use_fast=True)
-    model = AutoModelForQuestionAnswering.from_pretrained(args.base_trained_model)
-    train_dataset = Dataset(args.train_path, 'train', tokenizer, False)
-    val_dataset = Dataset(args.dev_path, 'dev', tokenizer, False)
-    train_loader = DataLoader(train_dataset, args.batch_size, shuffle=True)
-    dev_loader = DataLoader(val_dataset, args.batch_size, shuffle=True)
+    model = AutoModelForQuestionAnswering.from_pretrained(args.base_trained_model).to(gpu)
+    model = DDP(model, device_ids=[gpu])
+    train_loader = DataLoader(args.train_dataset, batch_size, num_worker)
+    dev_loader = DataLoader(args.val_dataset, batch_size, num_worker)
+    
     optimizer = AdamW(model.parameters(), lr=5e-5, weight_decay=0.01)
-    log_file = open(args.log_file, 'w')
-    device = torch.device(f'cuda:{args.gpu_number}' if torch.cuda.is_available() else 'cpu')
-    torch.cuda.set_device(device) # change allocation of current GPU
-    torch.cuda.empty_cache()
+    min_loss = float('inf')
+    best_performance = {}
+
+    map_location = {'cuda:%d' % 0: 'cuda:%d' % gpu}
 
 
     if args.pretrained_model:
-        print("use trained model")
-        log_file.write("use trained model")
-        model.load_state_dict(torch.load(args.pretrained_model))
+        logger.info("use trained model")
+        model.load_state_dict(
+            torch.load(args.pretrained_model, map_location=map_location))
     
-    log_file.write(str(args))
-    model.to(device)
-    penalty = 0
-    min_loss = float('inf')
-
     for epoch in range(args.max_epoch):
-        print(f"Epoch : {epoch}")
-        # if args.do_train:
-        #     train(model, train_loader, optimizer, device)
-
-        pred_texts, ans_texts, loss = valid(model, dev_loader, device, tokenizer,log_file)
+        dist.barrier()
+        if gpu==0: logger.info(f"Epoch : {epoch}")
+        if args.do_train:
+            train(gpu, model, train_loader, optimizer) # TODO
+        pred_texts, ans_texts, loss = valid(gpu, model, dev_loader, args.tokenizer)
         
         EM, F1 = 0, 0
         for iter, (pred_text, ans_text) in enumerate(zip(pred_texts, ans_texts)):
             EM += compute_exact_match(pred_text, ans_text)
             F1 += compute_F1(pred_text, ans_text)
         
-        print("Epoch : %d, EM : %.04f, F1 : %.04f, Loss : %.04f" % (epoch, EM/iter, F1/iter, loss))
-        log_file.writelines("Epoch : %d, EM : %.04f, F1 : %.04f, Loss : %.04f" % (epoch, EM/iter, F1/iter, loss))
+        logger.info("Epoch : %d, EM : %.04f, F1 : %.04f, Loss : %.04f" % (epoch, EM/iter, F1/iter, loss))
 
-        writer.add_scalar("EM", EM/iter, epoch)
-        writer.add_scalar("F1", F1/iter, epoch)
-        writer.add_scalar("loss",loss, epoch)
 
 
         if loss < min_loss:
             print("New best")
             min_loss = loss
-            penalty = 0
+            best_performance['min_loss'] = min_loss.item()
+            best_performance['EM'] = EM/iter
+            best_performance['F1'] = F1/iter
             if not args.debugging:
-                torch.save(model.state_dict(), f"model/{now_time}.pt")
-        else:
-            penalty +=1
-            if penalty>args.patience:
-                print(f"early stopping at epoch {epoch}")
-                break
-    writer.close()
-    log_file.close()
+                torch.save(model.state_dict(), f"model/woz{args.data_rate}.pt")
+            logger.info("safely saved")
+            
+    logger.info(f"Best Score :  {best_performance}" )
+    dist.barrier()
+
+            
+            
+
+# @email_sender(recipient_emails=["jihyunlee@postech.ac.kr"], sender_email="knowing.deep.clean.water@gmail.com")
+def main():
+    makedirs("./data"); makedirs("./logs"); makedirs("./model");
     
-    return {'EM' : EM/iter, 'F1' : F1/iter}
+    args.world_size = args.gpus * args.nodes 
+    args.tokenizer = AutoTokenizer.from_pretrained(args.base_trained_model, use_fast=False)
+    train_path = args.train_path[:-5] + str(args.data_rate) + '.json'
+    args.train_dataset = Dataset(train_path, 'train', args.data_rate, args.tokenizer, False)
+    args.val_dataset = Dataset(args.dev_path, 'dev', args.data_rate, args.tokenizer, False)
+    
+    mp.spawn(main_worker,
+        nprocs=args.world_size,
+        args=(args,),
+        join=True)
 
     
 if __name__ =="__main__":
+    logger.info(f"{'-' * 30}")
+    logger.info(args)
+    logger.info("Start New Trainning")
+    start = time.time()
     main()
+    result_list = str(datetime.timedelta(seconds=time.time() - start)).split(".")
+    logger.info(result_list[0])
+    logger.info("End The Trainning")
+    logger.info(f"{'-' * 30}")
 
     
