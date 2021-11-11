@@ -1,2 +1,2 @@
-# bert-extract-woz
-bert-extract-woz
+# bert-qa
+qa with bert
