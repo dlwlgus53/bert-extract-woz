@@ -13,13 +13,17 @@ class Dataset(torch.utils.data.Dataset):
         self.tokenizer = tokenizer
         self.encodings = []
         self.error_list = {}
-
+        if type == 'train':
+            raw_path = f'data/preprocessed_{type}_{data_rate}.pickle'
+        else:
+            raw_path = f'data/preprocessed_{type}.pickle'
+            
         try:
             if debug:
                 0/0
             else :    
-                print(f"data/preprocessed_{type}_{data_rate}.pickle")
-                with open(f'data/preprocessed_{type}_{data_rate}.pickle', 'rb') as f:
+                print(f"load {raw_path}")
+                with open(raw_path, 'rb') as f:
                     encodings = pickle.load(f)
                     self.encodings = encodings
         except:
@@ -34,7 +38,7 @@ class Dataset(torch.utils.data.Dataset):
             encodings = self._add_token_positions(encodings, answer)
             encodings.update({'dial_id' :dial_id, 'turn_id' : turn_id, 'schema' : schema})
 
-            with open(f'data/preprocessed_{type}_{data_rate}.pickle', 'wb') as f:
+            with open(raw_path, 'wb') as f:
                 pickle.dump(encodings, f, pickle.HIGHEST_PROTOCOL)
 
         self.encodings = encodings

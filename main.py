@@ -91,7 +91,7 @@ def main_worker(gpu, args):
 
 
 
-        if loss < min_loss:
+        if gpu == 0 and loss < min_loss:
             print("New best")
             min_loss = loss
             best_performance['min_loss'] = min_loss.item()
